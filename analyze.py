@@ -40,7 +40,7 @@ MUTED = "#666666"
 GRID = "#e4e4e4"
 
 plt.rcParams.update({
-    "font.size": 12,
+    "font.size": 13,
     "axes.edgecolor": MUTED,
     "axes.labelcolor": INK,
     "xtick.color": MUTED,
@@ -91,75 +91,265 @@ def compute_metrics(df, prefix):
     }
 
 
-def plot_run(df, title, path):
+# Safety and comfort references drawn in the plots
+MIN_DISTANCE = 8.0      # same as main.py [m]
+COMFORT_ACCEL = 2.0     # typical ACC comfort limit [m/s^2]
+
+DANGER = "#d64545"
+DANGER_FILL = "#fbe3e3"
+COMFORT_FILL = "#eef3ea"
+
+NAMES = {"pid": "PID", "mpc": "MPC"}
+
+
+def brake_start(df):
+    """Time when the lead starts slowing down, or None."""
+    lead = df["lead_reference_kmh"].to_numpy()
+    slowing = np.nonzero(np.diff(lead) < -1e-6)[0]
+    return float(df["t_s"].iloc[slowing[0]]) if len(slowing) else None
+
+
+def mark_brake_start(axes, df):
+    t_brake = brake_start(df)
+    if t_brake is None:
+        return
+
+    for ax in axes:
+        ax.axvline(t_brake, color=MUTED, linewidth=1.0, linestyle=(0, (4, 3)))
+
+    axes[0].annotate(
+        "Lead brakes",
+        (t_brake, 1.0),
+        xycoords=("data", "axes fraction"),
+        xytext=(6, -4),
+        textcoords="offset points",
+        va="top",
+        color=MUTED,
+        fontsize=11
+    )
+
+
+def style_gap_axis(ax):
+    # Everything below the minimum distance is unsafe
+    ax.axhspan(-100, MIN_DISTANCE, color=DANGER_FILL, zorder=0)
+    ax.axhline(MIN_DISTANCE, color=DANGER, linewidth=1.0, zorder=1)
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Gap [m]")
+
+
+def style_accel_axis(ax):
+    ax.axhspan(-COMFORT_ACCEL, COMFORT_ACCEL, color=COMFORT_FILL, zorder=0)
+    ax.axhline(0, color=MUTED, linewidth=0.8)
+    ax.set_ylabel("Acceleration [m/s²]")
+
+
+def mark_min_gap(ax, df, prefix, color):
+    i = int(df[f"{prefix}_gap_m"].idxmin())
+    t_min = df["t_s"].iloc[i]
+    gap_min = df[f"{prefix}_gap_m"].iloc[i]
+
+    ax.plot(t_min, gap_min, "o", color=color, markersize=8,
+            markeredgecolor="white", markeredgewidth=1.5, zorder=5)
+
+    # Keep the label inside the plot when the minimum is at the end
+    t = df["t_s"]
+    near_end = t_min > t.iloc[0] + 0.8 * (t.iloc[-1] - t.iloc[0])
+
+    ax.annotate(
+        f"{NAMES[prefix]} min {gap_min:.1f} m",
+        (t_min, gap_min),
+        xytext=(-10 if near_end else 10, 30 if prefix == "pid" else 14),
+        textcoords="offset points",
+        ha="right" if near_end else "left",
+        color=INK,
+        fontsize=11
+    )
+
+
+def mark_collision(ax, df, prefix):
+    hits = df.index[df[f"{prefix}_collision"] > 0]
+    if not len(hits):
+        return
+
+    i = hits[0]
+    ax.plot(df["t_s"].iloc[i], df[f"{prefix}_gap_m"].iloc[i], "X",
+            color=DANGER, markersize=13, markeredgecolor="white", zorder=6)
+    ax.annotate(
+        f"{NAMES[prefix]} collision",
+        (df["t_s"].iloc[i], df[f"{prefix}_gap_m"].iloc[i]),
+        xytext=(10, 6 if prefix == "pid" else 22),
+        textcoords="offset points",
+        color=DANGER,
+        fontsize=11,
+        fontweight="bold"
+    )
+
+
+def plot_overview(df, title, path):
+    """Speed, gap and acceleration over time for one run (16:9)."""
     t = df["t_s"]
 
+    fig, (ax_speed, ax_gap, ax_accel) = plt.subplots(
+        3, 1,
+        figsize=(13.33, 7.5),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1, 1.3, 1]}
+    )
+
+    ax_speed.plot(t, df["lead_reference_kmh"], color=COLORS["lead"],
+                  linestyle=":", linewidth=2.2, label="Lead car")
+
+    for prefix in ("pid", "mpc"):
+        color = COLORS[prefix]
+        style = STYLES[prefix]
+        accel, _ = derived_signals(df, prefix)
+
+        ax_speed.plot(t, df[f"{prefix}_ego_kmh"], color=color,
+                      linestyle=style, label=NAMES[prefix])
+
+        ax_gap.plot(t, df[f"{prefix}_desired_gap_m"], color=color,
+                    linestyle=":", linewidth=1.2, alpha=0.7)
+        ax_gap.plot(t, df[f"{prefix}_gap_m"], color=color, linestyle=style)
+
+        ax_accel.plot(t, accel, color=color, linestyle=style, linewidth=1.8)
+
+        mark_min_gap(ax_gap, df, prefix, color)
+        mark_collision(ax_gap, df, prefix)
+
+    ax_speed.set_ylabel("Speed [km/h]")
+    ax_speed.set_ylim(bottom=0)
+    style_gap_axis(ax_gap)
+    style_accel_axis(ax_accel)
+    ax_accel.set_xlabel("Time [s]")
+
+    mark_brake_start((ax_speed, ax_gap, ax_accel), df)
+
+    ax_speed.legend(loc="lower left", ncol=3)
+
+    ax_gap.text(0.995, 0.96, "solid/dashed = actual gap,  dotted = desired gap",
+                transform=ax_gap.transAxes, ha="right", va="top",
+                color=MUTED, fontsize=10)
+    ax_gap.text(0.995, 0.02, f"unsafe (< {MIN_DISTANCE:.0f} m)",
+                transform=ax_gap.transAxes, ha="right", va="bottom",
+                color=DANGER, fontsize=10)
+    ax_accel.text(0.995, 0.96, f"shaded = comfortable (±{COMFORT_ACCEL:.0f} m/s²)",
+                  transform=ax_accel.transAxes, ha="right", va="top",
+                  color=MUTED, fontsize=10)
+
+    ax_accel.set_xlim(t.iloc[0], t.iloc[-1])
+
+    fig.suptitle(title, color=INK, fontsize=16, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_good_vs_good(runs, path):
+    """Gap and acceleration for all scenarios, good vs good, side by side."""
+    scenarios = [
+        s for s in ("gentle", "emergency", "stop_and_go")
+        if (s, "good", "good") in runs
+    ]
+
+    if not scenarios:
+        return
+
     fig, axes = plt.subplots(
-        4, 1,
-        figsize=(11, 11),
+        2, len(scenarios),
+        figsize=(13.33, 7.5),
+        sharex="col",
+        squeeze=False
+    )
+
+    for col, scenario in enumerate(scenarios):
+        df = runs[(scenario, "good", "good")]
+        t = df["t_s"]
+        ax_gap, ax_accel = axes[0, col], axes[1, col]
+
+        for prefix in ("pid", "mpc"):
+            accel, _ = derived_signals(df, prefix)
+            ax_gap.plot(t, df[f"{prefix}_desired_gap_m"], color=COLORS[prefix],
+                        linestyle=":", linewidth=1.2, alpha=0.7)
+            ax_gap.plot(t, df[f"{prefix}_gap_m"], color=COLORS[prefix],
+                        linestyle=STYLES[prefix], label=NAMES[prefix])
+            ax_accel.plot(t, accel, color=COLORS[prefix],
+                          linestyle=STYLES[prefix], linewidth=1.6)
+            mark_collision(ax_gap, df, prefix)
+
+        style_gap_axis(ax_gap)
+        style_accel_axis(ax_accel)
+        mark_brake_start((ax_gap, ax_accel), df)
+
+        ax_gap.set_title(scenario.replace("_", " ").capitalize(),
+                         color=INK, fontsize=14, loc="left")
+        ax_accel.set_xlabel("Time [s]")
+        ax_accel.set_xlim(t.iloc[0], t.iloc[-1])
+
+        if col > 0:
+            ax_gap.set_ylabel("")
+            ax_accel.set_ylabel("")
+
+    axes[0, 0].legend(loc="lower left")
+
+    fig.suptitle("Good tuning: PID vs MPC in all scenarios",
+                 color=INK, fontsize=16, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_tuning(runs, scenario, path):
+    """Good vs bad tuning of each controller in one scenario."""
+    # (prefix, preset) -> run that contains it, preferring the good/good run
+    lines = {}
+
+    for (s, pid_preset, mpc_preset), df in runs.items():
+        if s != scenario:
+            continue
+        for prefix, preset in (("pid", pid_preset), ("mpc", mpc_preset)):
+            key = (prefix, preset)
+            if key not in lines or (pid_preset, mpc_preset) == ("good", "good"):
+                lines[key] = df
+
+    if not any(preset == "bad" for _, preset in lines):
+        return
+
+    fig, (ax_gap, ax_accel) = plt.subplots(
+        2, 1,
+        figsize=(13.33, 7.5),
         sharex=True
     )
 
-    ax_speed, ax_gap, ax_accel, ax_jerk = axes
+    for (prefix, preset), df in sorted(lines.items()):
+        t = df["t_s"]
+        accel, _ = derived_signals(df, prefix)
+        good = preset == "good"
 
-    ax_speed.plot(
-        t, df["lead_reference_kmh"],
-        color=COLORS["lead"], linestyle=":", label="Lead"
+        kwargs = dict(
+            color=COLORS[prefix],
+            linestyle=STYLES[prefix] if good else (0, (1, 1.5)),
+            linewidth=2.2 if good else 2.0,
+            alpha=1.0 if good else 0.75,
+        )
+
+        label = f"{NAMES[prefix]} {preset}"
+        ax_gap.plot(t, df[f"{prefix}_gap_m"], label=label, **kwargs)
+        ax_accel.plot(t, accel, **kwargs)
+
+        mark_collision(ax_gap, df, prefix)
+
+    style_gap_axis(ax_gap)
+    style_accel_axis(ax_accel)
+    mark_brake_start((ax_gap, ax_accel), df)
+
+    ax_gap.legend(loc="center left", ncol=2)
+    ax_accel.set_xlabel("Time [s]")
+    ax_accel.set_xlim(t.iloc[0], t.iloc[-1])
+
+    fig.suptitle(
+        f"{scenario.replace('_', ' ').capitalize()}: good vs bad tuning",
+        color=INK, fontsize=16, x=0.01, ha="left"
     )
-
-    for prefix in ("pid", "mpc"):
-        name = prefix.upper()
-        color = COLORS[prefix]
-        style = STYLES[prefix]
-
-        accel, jerk = derived_signals(df, prefix)
-
-        ax_speed.plot(
-            t, df[f"{prefix}_ego_kmh"],
-            color=color, linestyle=style, label=name
-        )
-
-        ax_gap.plot(
-            t, df[f"{prefix}_gap_m"],
-            color=color, linestyle=style, label=f"{name} gap"
-        )
-
-        ax_gap.plot(
-            t, df[f"{prefix}_desired_gap_m"],
-            color=color, linestyle=style, linewidth=1.0, alpha=0.45,
-            label=f"{name} desired"
-        )
-
-        ax_accel.plot(t, accel, color=color, linestyle=style, label=name)
-        ax_jerk.plot(t, jerk, color=color, linestyle=style, label=name)
-
-        hits = df.index[df[f"{prefix}_collision"] > 0]
-        if len(hits):
-            t_hit = t[hits[0]]
-            for ax in axes:
-                ax.axvline(t_hit, color=color, linewidth=1.0, alpha=0.6)
-            ax_gap.annotate(
-                f"{name} collision",
-                (t_hit, 0),
-                xytext=(5, 10),
-                textcoords="offset points",
-                color=INK
-            )
-
-    ax_gap.axhline(
-        0, color=MUTED, linewidth=1.0
-    )
-
-    ax_speed.set_ylabel("Speed [km/h]")
-    ax_gap.set_ylabel("Gap [m]")
-    ax_accel.set_ylabel("Acceleration [m/s²]")
-    ax_jerk.set_ylabel("Jerk [m/s³]")
-    ax_jerk.set_xlabel("Time [s]")
-
-    ax_speed.legend(loc="upper right", ncol=3)
-    ax_gap.legend(loc="upper right", ncol=2, fontsize=10)
-
-    fig.suptitle(title, color=INK, fontsize=15, x=0.06, ha="left")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -232,6 +422,7 @@ def main():
         return
 
     records = []
+    runs = {}
 
     for log in logs:
         run = log.parent.name
@@ -252,13 +443,23 @@ def main():
                 **compute_metrics(df, prefix),
             })
 
+        runs[(scenario, pid_preset, mpc_preset)] = df
+
         title = (
-            f"{scenario.replace('_', ' ').capitalize()} - "
+            f"{scenario.replace('_', ' ').capitalize()}: "
             f"PID ({pid_preset}) vs MPC ({mpc_preset})"
         )
 
-        plot_run(df, title, log.parent / "plots.png")
-        print(f"Plotted {log.parent / 'plots.png'}")
+        # Replaced by overview.png
+        (log.parent / "plots.png").unlink(missing_ok=True)
+
+        plot_overview(df, title, log.parent / "overview.png")
+        print(f"Plotted {log.parent / 'overview.png'}")
+
+    plot_good_vs_good(runs, RESULTS / "good_vs_good.png")
+
+    for scenario in ("gentle", "emergency", "stop_and_go"):
+        plot_tuning(runs, scenario, RESULTS / f"tuning_{scenario}.png")
 
     metrics = pd.DataFrame(records)
 
