@@ -17,7 +17,11 @@ import pandas as pd
 RESULTS = Path("results")
 
 # Moving-average window for CARLA's noisy acceleration signal [s]
-SMOOTH_WINDOW = 0.25
+SMOOTH_WINDOW = 0.5
+
+# Skip the spawn transient (cars get their initial speed at t=0,
+# which gives a huge acceleration spike) [s]
+SETTLE_TIME = 1.0
 
 # Same colors as the cars in the video
 COLORS = {
@@ -232,6 +236,7 @@ def main():
     for log in logs:
         run = log.parent.name
         df = pd.read_csv(log)
+        df = df[df["t_s"] >= SETTLE_TIME].reset_index(drop=True)
 
         scenario, pid_part, mpc_part = run.rsplit("_", 2)
         pid_preset = pid_part.removeprefix("pid-")

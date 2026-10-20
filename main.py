@@ -22,8 +22,8 @@ STRAIGHT_START = 70.0
 
 # Default duration per scenario [s]
 DURATIONS = {
-    "gentle": 30.0,
-    "emergency": 25.0,
+    "gentle": 35.0,
+    "emergency": 30.0,
     "stop_and_go": 45.0,
 }
 
@@ -346,6 +346,25 @@ def spawn_vehicle(world, blueprint_name, waypoint, color):
         )
 
     return vehicle
+
+
+def waypoint_ahead(waypoint, distance):
+    """
+    Waypoint exactly `distance` metres ahead in the same lane.
+    """
+
+    candidates = waypoint.next(distance)
+
+    same_lane = [
+        w for w in candidates
+        if w.road_id == waypoint.road_id
+        and w.lane_id == waypoint.lane_id
+    ]
+
+    if not (same_lane or candidates):
+        raise RuntimeError("Selected route is too short")
+
+    return (same_lane or candidates)[0]
 
 
 def set_vehicle_speed(vehicle, target_speed):
@@ -676,22 +695,6 @@ def main():
             + TIME_GAP * initial_speed
         )
 
-        # Desired bumper-to-bumper gap
-        vehicle_length = 4.6
-
-        lead_index = math.ceil(
-            (initial_gap + vehicle_length)
-            / ROAD_STEP
-        )
-
-        if lead_index >= min(
-            len(route_pid),
-            len(route_mpc)
-        ):
-            raise RuntimeError(
-                "Selected route is too short"
-            )
-
         # ==========================================
         # SPAWN PID PAIR
         # ==========================================
@@ -704,10 +707,17 @@ def main():
         )
         vehicles.append(ego_pid)
 
+        # Center-to-center distance giving the exact
+        # bumper-to-bumper gap (both cars are the same model)
+        lead_distance = (
+            initial_gap
+            + 2.0 * ego_pid.bounding_box.extent.x
+        )
+
         lead_pid = spawn_vehicle(
             world,
             "vehicle.tesla.model3",
-            route_pid[lead_index],
+            waypoint_ahead(route_pid[0], lead_distance),
             LEAD_COLOR
         )
         vehicles.append(lead_pid)
@@ -727,7 +737,7 @@ def main():
         lead_mpc = spawn_vehicle(
             world,
             "vehicle.tesla.model3",
-            route_mpc[lead_index],
+            waypoint_ahead(route_mpc[0], lead_distance),
             LEAD_COLOR
         )
         vehicles.append(lead_mpc)
