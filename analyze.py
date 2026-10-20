@@ -23,6 +23,14 @@ SMOOTH_WINDOW = 0.5
 # which gives a huge acceleration spike) [s]
 SETTLE_TIME = 1.0
 
+# Metrics are computed from here on. Before this, CARLA's gearbox
+# makes the cars lose speed after spawn and they catch up hard,
+# which is a simulator artifact and not controller behaviour.
+# Every scenario's first event is at t >= 10 s. [s]
+EVAL_START = 8.0
+
+SCENARIO_ORDER = ["gentle", "emergency", "stop_and_go"]
+
 # Same colors as the cars in the video
 COLORS = {
     "pid": "#1a9e50",
@@ -129,6 +137,27 @@ def mark_brake_start(axes, df):
     )
 
 
+def mark_startup(axes, df):
+    t0 = df["t_s"].iloc[0]
+
+    for ax in axes:
+        ax.axvspan(t0, EVAL_START, color="#f2f2f2", zorder=0)
+
+    axes[-1].annotate(
+        "start-up\n(not in metrics)",
+        ((t0 + EVAL_START) / 2, 0.0),
+        xycoords=("data", "axes fraction"),
+        xytext=(0, 4),
+        textcoords="offset points",
+        ha="center",
+        va="bottom",
+        color=MUTED,
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.2", fc="#f2f2f2", ec="none"),
+        zorder=10
+    )
+
+
 def style_gap_axis(ax):
     # Everything below the minimum distance is unsafe
     ax.axhspan(-100, MIN_DISTANCE, color=DANGER_FILL, zorder=0)
@@ -216,6 +245,7 @@ def plot_overview(df, title, path):
         mark_min_gap(ax_gap, df, prefix, color)
         mark_collision(ax_gap, df, prefix)
 
+    mark_startup((ax_speed, ax_gap, ax_accel), df)
     ax_speed.set_ylabel("Speed [km/h]")
     ax_speed.set_ylim(bottom=0)
     style_gap_axis(ax_gap)
@@ -276,6 +306,7 @@ def plot_good_vs_good(runs, path):
                           linestyle=STYLES[prefix], linewidth=1.6)
             mark_collision(ax_gap, df, prefix)
 
+        mark_startup((ax_gap, ax_accel), df)
         style_gap_axis(ax_gap)
         style_accel_axis(ax_accel)
         mark_brake_start((ax_gap, ax_accel), df)
@@ -338,6 +369,7 @@ def plot_tuning(runs, scenario, path):
 
         mark_collision(ax_gap, df, prefix)
 
+    mark_startup((ax_gap, ax_accel), df)
     style_gap_axis(ax_gap)
     style_accel_axis(ax_accel)
     mark_brake_start((ax_gap, ax_accel), df)
@@ -433,6 +465,8 @@ def main():
         pid_preset = pid_part.removeprefix("pid-")
         mpc_preset = mpc_part.removeprefix("mpc-")
 
+        evaluated = df[df["t_s"] >= EVAL_START].reset_index(drop=True)
+
         for prefix in ("pid", "mpc"):
             records.append({
                 "scenario": scenario,
@@ -440,7 +474,7 @@ def main():
                 "mpc_preset": mpc_preset,
                 "controller": prefix.upper(),
                 "tuning": pid_preset if prefix == "pid" else mpc_preset,
-                **compute_metrics(df, prefix),
+                **compute_metrics(evaluated, prefix),
             })
 
         runs[(scenario, pid_preset, mpc_preset)] = df
@@ -463,10 +497,35 @@ def main():
 
     metrics = pd.DataFrame(records)
 
+    # The same controller + tuning appears in several runs (e.g. PID
+    # good in pid-good_mpc-good and pid-good_mpc-bad): keep one row,
+    # preferring the good/good run
+    metrics["from_good_good"] = (
+        (metrics["pid_preset"] == "good")
+        & (metrics["mpc_preset"] == "good")
+    )
+
+    metrics["scenario_order"] = metrics["scenario"].map(
+        {s: i for i, s in enumerate(SCENARIO_ORDER)}
+    )
+
+    metrics = (
+        metrics
+        .sort_values("from_good_good", ascending=False)
+        .drop_duplicates(["scenario", "controller", "tuning"])
+        .sort_values(
+            ["scenario_order", "controller", "tuning"],
+            ascending=[True, False, False]
+        )
+        .drop(columns=["from_good_good", "scenario_order"])
+        .reset_index(drop=True)
+    )
+
     metrics.to_csv(RESULTS / "metrics.csv", index=False)
 
     table = metrics.drop(columns=["pid_preset", "mpc_preset"]).copy()
     table["collision"] = table["collision"].map({True: "YES", False: "no"})
+    table = table.rename(columns={"max_jerk_ms3": "max_jerk_ms3 (noisy)"})
 
     (RESULTS / "metrics.md").write_text(
         table.to_markdown(index=False, floatfmt=".2f"),
