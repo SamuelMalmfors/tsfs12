@@ -12,8 +12,22 @@ PID_PRESETS = {
         max_du=None
     ),
 
-    # PD with rate limit on the output to keep jerk down
+    # Full PID: the integral term builds up the throttle needed to
+    # hold speed against driving resistance, so the distance error
+    # goes to zero. Integral bounded (anti-windup) so it cannot
+    # delay braking. Rate limit on the output to keep jerk down.
     "good": dict(
+        kp=0.20,
+        ki=0.05,
+        kd=0.20,
+        max_du=0.04,
+        integral_limit=20.0
+    ),
+
+    # Same as "good" without integral term (PD): needs a distance
+    # error to produce throttle, so it settles ~0.59 / kp = 3 m
+    # too far back
+    "pd": dict(
         kp=0.20,
         ki=0.0,
         kd=0.20,

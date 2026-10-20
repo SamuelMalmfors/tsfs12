@@ -30,6 +30,17 @@ SETTLE_TIME = 1.0
 EVAL_START = 8.0
 
 SCENARIO_ORDER = ["gentle", "emergency", "stop_and_go"]
+TUNING_ORDER = ["good", "pd", "bad"]
+
+# Line style per tuning in the good-vs-bad plots ("good" uses the
+# controller's own style)
+TUNING_STYLE = {
+    "good": dict(linewidth=2.2, alpha=1.0),
+    "pd": dict(linestyle=(0, (6, 2, 1, 2)), linewidth=2.0, alpha=0.8),
+    "bad": dict(linestyle=(0, (1, 1.5)), linewidth=2.0, alpha=0.75),
+}
+
+TUNING_LABEL = {"pd": "PD (no I-term)"}
 
 # Same colors as the cars in the video
 COLORS = {
@@ -354,16 +365,14 @@ def plot_tuning(runs, scenario, path):
     for (prefix, preset), df in sorted(lines.items()):
         t = df["t_s"]
         accel, _ = derived_signals(df, prefix)
-        good = preset == "good"
+        kwargs = dict(color=COLORS[prefix], **TUNING_STYLE.get(
+            preset, TUNING_STYLE["bad"]
+        ))
 
-        kwargs = dict(
-            color=COLORS[prefix],
-            linestyle=STYLES[prefix] if good else (0, (1, 1.5)),
-            linewidth=2.2 if good else 2.0,
-            alpha=1.0 if good else 0.75,
-        )
+        if preset == "good":
+            kwargs["linestyle"] = STYLES[prefix]
 
-        label = f"{NAMES[prefix]} {preset}"
+        label = f"{NAMES[prefix]} {TUNING_LABEL.get(preset, preset)}"
         ax_gap.plot(t, df[f"{prefix}_gap_m"], label=label, **kwargs)
         ax_accel.plot(t, accel, **kwargs)
 
@@ -508,16 +517,19 @@ def main():
     metrics["scenario_order"] = metrics["scenario"].map(
         {s: i for i, s in enumerate(SCENARIO_ORDER)}
     )
+    metrics["tuning_order"] = metrics["tuning"].map(
+        {s: i for i, s in enumerate(TUNING_ORDER)}
+    )
 
     metrics = (
         metrics
         .sort_values("from_good_good", ascending=False)
         .drop_duplicates(["scenario", "controller", "tuning"])
         .sort_values(
-            ["scenario_order", "controller", "tuning"],
-            ascending=[True, False, False]
+            ["scenario_order", "controller", "tuning_order"],
+            ascending=[True, False, True]
         )
-        .drop(columns=["from_good_good", "scenario_order"])
+        .drop(columns=["from_good_good", "scenario_order", "tuning_order"])
         .reset_index(drop=True)
     )
 
