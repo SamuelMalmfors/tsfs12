@@ -4,3 +4,4 @@ __pycache__/
 .env
 .vscode/
 results_*.csv
+results/*/video.mp4

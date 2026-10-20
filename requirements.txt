@@ -1,0 +1,10 @@
+# carla must match the CARLA server version
+carla==0.9.16
+cvxpy
+numpy
+pandas
+matplotlib
+tabulate
+imageio
+imageio-ffmpeg
+pillow

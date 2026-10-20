@@ -1,3 +1,4 @@
+import argparse
 import csv
 import math
 import time
@@ -7,6 +8,7 @@ import carla
 
 from controllers.pid_controller import PIDController
 from controllers.mpc_controller import MPCController
+from controllers.presets import PID_PRESETS, MPC_PRESETS
 from scenarios.lead_vehicle import get_lead_target_speed
 
 
@@ -15,19 +17,19 @@ from scenarios.lead_vehicle import get_lead_target_speed
 # ============================================================
 
 DT = 0.05
-DURATION = 45.0
-REAL_TIME = True
 ROAD_CHOICE = 1       # 0 = bästa vägen, 1 = näst bästa, 2 = tredje
 STRAIGHT_START = 70.0
-#SCENARIO = "emergency"
-# SCENARIO = "gentle"
-SCENARIO = "stop_and_go"
+
+# Default duration per scenario [s]
+DURATIONS = {
+    "gentle": 30.0,
+    "emergency": 25.0,
+    "stop_and_go": 45.0,
+}
 
 MIN_DISTANCE = 8.0
 TIME_GAP = 1.5
 CRUISE_SPEED = 80.0 / 3.6
-
-INITIAL_GAP = 41.3
 
 LEAD_MAX_ACCEL = 2.5
 LEAD_MAX_BRAKE = 6.0
@@ -52,6 +54,18 @@ def clamp(value, low, high):
 def get_speed(vehicle):
     v = vehicle.get_velocity()
     return math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+
+def get_longitudinal_accel(vehicle):
+    a = vehicle.get_acceleration()
+    forward = vehicle.get_transform().get_forward_vector()
+    return a.x * forward.x + a.y * forward.y + a.z * forward.z
+
+
+def get_time_gap(gap, speed):
+    if speed < 1.0:
+        return float("nan")
+    return gap / speed
 
 
 def get_gap(ego, lead):
@@ -346,6 +360,34 @@ def set_vehicle_speed(vehicle, target_speed):
     )
 
 
+def attach_collision_sensor(world, vehicle, flag):
+    """
+    flag is a dict; flag["hit"] is set to True on first collision.
+    """
+
+    bp = world.get_blueprint_library().find(
+        "sensor.other.collision"
+    )
+
+    sensor = world.spawn_actor(
+        bp,
+        carla.Transform(),
+        attach_to=vehicle
+    )
+
+    def on_collision(event):
+        if not flag["hit"]:
+            print(
+                f"COLLISION: {flag['name']} hit "
+                f"{event.other_actor.type_id}"
+            )
+        flag["hit"] = True
+
+    sensor.listen(on_collision)
+
+    return sensor
+
+
 # ============================================================
 # PURE PURSUIT STEERING
 # ============================================================
@@ -415,18 +457,36 @@ def steering(vehicle, route, lookahead=15.0):
 # VISUALIZATION
 # ============================================================
 
-def draw_label(world, vehicle, text, color):
-    location = vehicle.get_location()
-    location.z += 3.2
+def hud_lines(scenario, t, args, lead_speed, pid_state, mpc_state):
+    """
+    Text for the corner panel in the viewer window.
+    *_state: dict with speed, gap, desired_gap, min_gap, collision
+    """
 
-    world.debug.draw_string(
-        location,
-        f"{text} | {get_speed(vehicle)*3.6:.0f} km/h",
-        draw_shadow=True,
-        color=color,
-        life_time=0.12,
-        persistent_lines=False
-    )
+    def controller_lines(name, preset, state, color):
+        status = "  COLLISION" if state["collision"] else ""
+        time_gap = get_time_gap(state["gap"], state["speed"])
+        time_gap_text = "  -  " if math.isnan(time_gap) else f"{time_gap:4.1f}"
+
+        return [
+            (f"{name} ({preset}){status}", (255, 80, 80) if status else color),
+            (
+                f"  {state['speed']*3.6:5.1f} km/h   "
+                f"gap {state['gap']:5.1f} / {state['desired_gap']:4.1f} m   "
+                f"{time_gap_text} s",
+                color
+            ),
+            (f"  min gap {state['min_gap']:5.1f} m", (170, 170, 180)),
+        ]
+
+    return [
+        (f"{scenario.replace('_', ' ')}   t = {t:4.1f} s", (235, 235, 235)),
+        (f"Lead  {lead_speed*3.6:5.1f} km/h", (200, 200, 200)),
+        ("", None),
+        *controller_lines("PID", args.pid, pid_state, (60, 220, 110)),
+        ("", None),
+        *controller_lines("MPC", args.mpc, mpc_state, (90, 170, 255)),
+    ]
 
 
 def update_camera(world, ego_pid, ego_mpc):
@@ -448,15 +508,17 @@ def update_camera(world, ego_pid, ego_mpc):
         z=center.z + 35.0
     )
 
-    world.get_spectator().set_transform(
-        carla.Transform(
-            camera_location,
-            carla.Rotation(
-                pitch=-40.0,
-                yaw=transform.rotation.yaw
-            )
+    camera_transform = carla.Transform(
+        camera_location,
+        carla.Rotation(
+            pitch=-40.0,
+            yaw=transform.rotation.yaw
         )
     )
+
+    world.get_spectator().set_transform(camera_transform)
+
+    return camera_transform
 
 
 # ============================================================
@@ -480,22 +542,113 @@ def update_lead_speed(current, target, dt):
 # MAIN
 # ============================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="PID vs MPC adaptive cruise control in CARLA"
+    )
+
+    parser.add_argument(
+        "--scenario",
+        choices=list(DURATIONS),
+        default="stop_and_go"
+    )
+
+    parser.add_argument(
+        "--pid",
+        choices=list(PID_PRESETS),
+        default="good",
+        help="PID tuning preset"
+    )
+
+    parser.add_argument(
+        "--mpc",
+        choices=list(MPC_PRESETS),
+        default="good",
+        help="MPC tuning preset"
+    )
+
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Simulation length in seconds (default depends on scenario)"
+    )
+
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Also save the viewer window as an mp4 video"
+    )
+
+    parser.add_argument(
+        "--no-view",
+        action="store_true",
+        help="Do not open the viewer window"
+    )
+
+    parser.add_argument(
+        "--no-realtime",
+        action="store_true",
+        help="Run as fast as possible instead of real time"
+    )
+
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    scenario = args.scenario
+    duration = args.duration or DURATIONS[scenario]
+
+    run_name = f"{scenario}_pid-{args.pid}_mpc-{args.mpc}"
+    output_dir = Path("results") / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     client = carla.Client(
         "localhost",
         2000
     )
 
-    client.set_timeout(30.0)
+    client.set_timeout(60.0)
 
-    print("Loading Town04...")
+    world = client.get_world()
 
-    world = client.load_world("Town04")
+    # Reloading the map is slow and can crash the server
+    # on Windows, so only load Town04 when needed
+    if not world.get_map().name.endswith("Town04"):
+        print("Loading Town04...")
+        world = client.load_world("Town04")
 
     original_settings = world.get_settings()
 
+    # A crashed earlier run may have left the server in
+    # synchronous mode with its cars still in the world
+    if original_settings.synchronous_mode:
+        original_settings.synchronous_mode = False
+        original_settings.fixed_delta_seconds = None
+        world.apply_settings(original_settings)
+
+    leftovers = [
+        actor for actor in world.get_actors()
+        if actor.type_id.startswith(("vehicle.", "sensor."))
+    ]
+
+    if leftovers:
+        print(f"Removing {len(leftovers)} leftover actors")
+        client.apply_batch_sync([
+            carla.command.DestroyActor(actor)
+            for actor in leftovers
+        ])
+
     vehicles = []
-    rows = []
+    sensors = []
+    view = None
+
+    # The log is written row by row so it survives a crash
+    log_path = output_dir / "log.csv"
+    log_file = log_path.open("w", newline="", encoding="utf-8")
+    log_writer = None
 
     try:
         settings = world.get_settings()
@@ -511,13 +664,23 @@ def main():
             road_map
         )
 
-        initial_speed = 0.0
+        # Start in steady state: all cars at the lead's
+        # initial speed, at the desired following distance
+        initial_speed = get_lead_target_speed(
+            0.0,
+            scenario
+        )
+
+        initial_gap = (
+            MIN_DISTANCE
+            + TIME_GAP * initial_speed
+        )
 
         # Desired bumper-to-bumper gap
         vehicle_length = 4.6
 
         lead_index = math.ceil(
-            (INITIAL_GAP + vehicle_length)
+            (initial_gap + vehicle_length)
             / ROAD_STEP
         )
 
@@ -569,13 +732,37 @@ def main():
         )
         vehicles.append(lead_mpc)
 
+        # ==========================================
+        # COLLISION SENSORS
+        # ==========================================
+
+        pid_collision = {"name": "PID", "hit": False}
+        mpc_collision = {"name": "MPC", "hit": False}
+
+        sensors.append(
+            attach_collision_sensor(world, ego_pid, pid_collision)
+        )
+        sensors.append(
+            attach_collision_sensor(world, ego_mpc, mpc_collision)
+        )
+
         for vehicle in vehicles:
             vehicle.apply_control(
                 carla.VehicleControl(
                     throttle=0.0,
-                    brake=1.0,
+                    brake=0.0,
                     steer=0.0
                 )
+            )
+
+        # Let the cars settle on the road before
+        # giving them their initial speed
+        world.tick()
+
+        for vehicle in vehicles:
+            set_vehicle_speed(
+                vehicle,
+                initial_speed
             )
 
         world.tick()
@@ -585,24 +772,25 @@ def main():
         # ==========================================
 
         pid = PIDController(
-            kp=0.20,
-            ki=0.0,
-            kd=0.20,
-            dt=DT
+            dt=DT,
+            **PID_PRESETS[args.pid]
         )
 
         mpc = MPCController(
             dt=0.1,
-            horizon=30,
             min_distance=MIN_DISTANCE,
             time_gap=TIME_GAP,
-            cruise_speed=CRUISE_SPEED
+            cruise_speed=CRUISE_SPEED,
+            **MPC_PRESETS[args.mpc]
         )
 
         mpc_acceleration = 0.0
         lead_reference_speed = initial_speed
 
-        print(f"Scenario: {SCENARIO}")
+        print(
+            f"Scenario: {scenario} | "
+            f"PID: {args.pid} | MPC: {args.mpc}"
+        )
 
         print(
             f"PID initial gap: "
@@ -614,12 +802,26 @@ def main():
             f"{get_gap(ego_mpc, lead_mpc):.1f} m"
         )
 
+        if not args.no_view:
+            from viewer import CameraView
+
+            view = CameraView(
+                world,
+                DT,
+                video_path=(
+                    output_dir / "video.mp4" if args.record else None
+                )
+            )
+
+        pid_min_gap = float("inf")
+        mpc_min_gap = float("inf")
+
         # ==========================================
         # SIMULATION LOOP
         # ==========================================
 
         for step in range(
-            int(DURATION / DT)
+            int(duration / DT)
         ):
             loop_start = time.perf_counter()
             t = step * DT
@@ -630,7 +832,7 @@ def main():
 
             target_speed = get_lead_target_speed(
                 t,
-                SCENARIO
+                scenario
             )
 
             lead_reference_speed = update_lead_speed(
@@ -771,48 +973,26 @@ def main():
             )
 
             # ======================================
-            # LABELS
+            # CAMERA
             # ======================================
 
-            draw_label(
-                world,
-                ego_pid,
-                "PID",
-                carla.Color(0, 255, 100)
-            )
-
-            draw_label(
-                world,
-                lead_pid,
-                "LEAD PID",
-                carla.Color(255, 255, 255)
-            )
-
-            draw_label(
-                world,
-                ego_mpc,
-                "MPC",
-                carla.Color(0, 150, 255)
-            )
-
-            draw_label(
-                world,
-                lead_mpc,
-                "LEAD MPC",
-                carla.Color(255, 255, 255)
-            )
-
-            update_camera(
+            camera_transform = update_camera(
                 world,
                 ego_pid,
                 ego_mpc
             )
 
+            if view is not None:
+                view.set_transform(camera_transform)
+
+            pid_min_gap = min(pid_min_gap, pid_gap)
+            mpc_min_gap = min(mpc_min_gap, mpc_gap)
+
             # ======================================
             # LOGGING
             # ======================================
 
-            rows.append({
+            row = {
                 "t_s": round(t, 3),
 
                 "lead_reference_kmh":
@@ -830,11 +1010,23 @@ def main():
                 "pid_desired_gap_m":
                     pid_desired_gap,
 
+                "pid_time_gap_s":
+                    get_time_gap(pid_gap, pid_speed),
+
+                "pid_accel":
+                    get_longitudinal_accel(ego_pid),
+
+                "pid_lead_accel":
+                    get_longitudinal_accel(lead_pid),
+
                 "pid_throttle":
                     pid_throttle,
 
                 "pid_brake":
                     pid_brake,
+
+                "pid_collision":
+                    int(pid_collision["hit"]),
 
                 "mpc_ego_kmh":
                     mpc_speed * 3.6,
@@ -848,6 +1040,15 @@ def main():
                 "mpc_desired_gap_m":
                     mpc_desired_gap,
 
+                "mpc_time_gap_s":
+                    get_time_gap(mpc_gap, mpc_speed),
+
+                "mpc_accel":
+                    get_longitudinal_accel(ego_mpc),
+
+                "mpc_lead_accel":
+                    get_longitudinal_accel(lead_mpc),
+
                 "mpc_target_accel":
                     mpc_acceleration,
 
@@ -855,10 +1056,56 @@ def main():
                     mpc_throttle,
 
                 "mpc_brake":
-                    mpc_brake
-            })
+                    mpc_brake,
 
-            world.tick()
+                "mpc_collision":
+                    int(mpc_collision["hit"])
+            }
+
+            if log_writer is None:
+                log_writer = csv.DictWriter(
+                    log_file,
+                    fieldnames=row.keys()
+                )
+                log_writer.writeheader()
+
+            log_writer.writerow(row)
+            log_file.flush()
+
+            frame_id = world.tick()
+
+            if view is not None:
+                view.show(frame_id, hud_lines(
+                    scenario,
+                    t,
+                    args,
+                    lead_reference_speed,
+                    {
+                        "speed": pid_speed,
+                        "gap": pid_gap,
+                        "desired_gap": pid_desired_gap,
+                        "min_gap": pid_min_gap,
+                        "collision": pid_collision["hit"],
+                    },
+                    {
+                        "speed": mpc_speed,
+                        "gap": mpc_gap,
+                        "desired_gap": mpc_desired_gap,
+                        "min_gap": mpc_min_gap,
+                        "collision": mpc_collision["hit"],
+                    },
+                ), labels=[
+                    (
+                        "PID",
+                        ego_pid.get_location() + carla.Location(z=2.5),
+                        (30, 170, 80)
+                    ),
+                    (
+                        "MPC",
+                        ego_mpc.get_location() + carla.Location(z=2.5),
+                        (40, 120, 230)
+                    ),
+                ])
 
             if step % 20 == 0:
                 print(
@@ -868,7 +1115,7 @@ def main():
                     f"Lead={lead_reference_speed*3.6:5.1f} km/h"
                 )
 
-            if REAL_TIME:
+            if not args.no_realtime:
                 elapsed = (
                     time.perf_counter()
                     - loop_start
@@ -881,30 +1128,27 @@ def main():
                     )
                 )
 
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+
     finally:
         print("Cleaning up...")
 
-        if rows:
-            output = Path(
-                f"results_{SCENARIO}_comparison.csv"
-            )
+        log_file.close()
+        print(f"Saved results to {log_path}")
 
-            with output.open(
-                "w",
-                newline="",
-                encoding="utf-8"
-            ) as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=rows[0].keys()
-                )
+        if view is not None:
+            try:
+                view.close()
+                if args.record:
+                    print(f"Saved video to {output_dir / 'video.mp4'}")
+            except Exception as exc:
+                print(f"Viewer warning: {exc}")
 
-                writer.writeheader()
-                writer.writerows(rows)
-
-            print(
-                f"Saved results to {output}"
-            )
+        for sensor in sensors:
+            if sensor.is_alive:
+                sensor.stop()
+                sensor.destroy()
 
         for vehicle in vehicles:
             if vehicle.is_alive:
